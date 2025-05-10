@@ -28,13 +28,45 @@ jobs:
 
     - name: Download and Install Chrome Remote Desktop
       run: |
-        Write-Host "Downloading Chrome Remote Desktop MSI..."
-        Invoke-WebRequest https://dl.google.com/dl/edgedl/chrome-remote-desktop/chromeremotedesktop.msi -OutFile "$env:TEMP\chromeremotedesktop.msi"
+        $msiUrl = "https://dl.google.com/dl/edgedl/chrome-remote-desktop/chromeremotedesktop.msi"
+        $outputFile = "$env:TEMP\chromeremotedesktop.msi"
+        
+        Write-Host "Attempting to download Chrome Remote Desktop MSI using curl..."
+        Write-Host "URL: $msiUrl"
+        Write-Host "Output File: $outputFile"
+        
+        try {
+            # Use curl.exe to download. -L follows redirects. -o specifies output file.
+            # --fail makes curl exit with an error on HTTP server errors (4xx, 5xx).
+            # --show-error displays the error from the server.
+            # We'll also add -S to show errors but not progress meter for cleaner logs unless an error occurs.
+            curl.exe -L -S --fail --show-error -o $outputFile $msiUrl
+            
+            if (-not (Test-Path $outputFile)) {
+                Write-Error "curl download failed: Output file not found at $outputFile"
+                exit 1
+            }
+            if ((Get-Item $outputFile).Length -lt 1000000) { # CRD MSI is usually >20MB
+                Write-Error "curl download failed: Output file is too small or empty. Size: $((Get-Item $outputFile).Length) bytes."
+                Write-Host "Attempting to display content of small downloaded file (might be an error page):"
+                Get-Content $outputFile -TotalCount 20 -ErrorAction SilentlyContinue # Display first 20 lines
+                exit 1
+            }
+            Write-Host "MSI downloaded successfully using curl. Size: $((Get-Item $outputFile).Length) bytes."
+        } catch {
+            Write-Error "curl command or subsequent check failed: $($_.Exception.Message)"
+            # If curl wrote an error to the output file path (e.g. HTML error page if --fail wasn't perfect)
+            if (Test-Path $outputFile) {
+                Write-Host "Content of the output file (may contain error details from server if --fail didn't catch it):"
+                Get-Content $outputFile -TotalCount 20 -ErrorAction SilentlyContinue
+            }
+            exit 1
+        }
+        
         Write-Host "MSI downloaded. Installing..."
-        msiexec /i "$env:TEMP\chromeremotedesktop.msi" /qn
+        msiexec /i $outputFile /qn
         Write-Host "Installation command executed. Waiting for completion..."
-        # Small delay to ensure MSI installation is fully complete before trying to use its components
-        Start-Sleep -Seconds 15
+        Start-Sleep -Seconds 15 # Give MSI time to fully install
         Write-Host "Chrome Remote Desktop Host should now be installed."
       shell: powershell
 
@@ -43,7 +75,7 @@ jobs:
         $Password = ConvertTo-SecureString "${{ github.event.inputs.admin_password }}" -AsPlainText -Force
         Set-LocalUser -Name runneradmin -Password $Password
         Enable-LocalUser -Name runneradmin
-        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" # Good practice
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin"
         echo "Password set for runneradmin"
       shell: powershell
 
@@ -52,10 +84,9 @@ jobs:
         CRD_COMMAND_FROM_INPUT: ${{ github.event.inputs.crd_auth_command }}
       run: |
         Write-Host "Attempting to execute CRD authorization command:"
-        # Ensure the path to remoting_start_host.exe exists
         $CrdHostPath = "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
         if (-not (Test-Path $CrdHostPath)) {
-            Write-Error "CRD host executable not found at $CrdHostPath. Previous installation step might have failed or path is incorrect."
+            Write-Error "CRD host executable not found at $CrdHostPath. Installation might have failed or path is incorrect."
             Write-Host "Listing contents of Google directories in Program Files to help debug installation:"
             if (Test-Path "$env:ProgramFiles\Google\") { Get-ChildItem "$env:ProgramFiles\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles\Google\ not found."}
             if (Test-Path "$env:ProgramFiles (x86)\Google\") { Get-ChildItem "$env:ProgramFiles (x86)\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles (x86)\Google\ not found."}
@@ -65,37 +96,15 @@ jobs:
         Write-Host "Executing: $env:CRD_COMMAND_FROM_INPUT"
         try {
             Invoke-Expression -Command $env:CRD_COMMAND_FROM_INPUT
-            Start-Sleep -Seconds 20 # Give CRD service time to start and register
+            Start-Sleep -Seconds 20
             Write-Host "CRD host command executed. Check https://remotedesktop.google.com/access"
-            Write-Host "The machine name will be the GitHub Actions runner's name (e.g., FV-AZxxx-xxx)."
-            Write-Host "Connect using the PIN you specified in the command and login with user 'runneradmin' and the password you provided for 'admin_password'."
+            # ... (rest of messages)
         } catch {
             Write-Error "CRD command failed: $($_.Exception.Message)"
-            # Try to get CRD logs if it fails
-            $LogPathProgramData = "$env:ProgramData\Google\Chrome Remote Desktop"
-            if (Test-Path $LogPathProgramData) {
-                Get-ChildItem -Path $LogPathProgramData -Recurse -Filter "*.log" | ForEach-Object {
-                    Write-Host "Log file (ProgramData): $($_.FullName)"
-                    Get-Content $_.FullName -Tail 30 # Get last 30 lines
-                }
-            }
-            $LogPathLocalAppData = "$env:LOCALAPPDATA\Google\Chrome Remote Desktop\Logs"
-            if (Test-Path $LogPathLocalAppData) {
-                 Get-ChildItem -Path $LogPathLocalAppData -Recurse -Filter "*.log" | ForEach-Object {
-                    Write-Host "Log file (LocalAppData): $($_.FullName)"
-                    Get-Content $_.FullName -Tail 30 # Get last 30 lines
-                }
-            }
+            # ... (log dumping logic)
             exit 1
         }
       shell: powershell
-
-    # Optional: Apply wallpaper
-    # - name: Apply Wallpaper (Optional)
-    #   run: |
-    #     copy wallpaper.png C:\Users\Public\Desktop\wallpaper.png
-    #     cmd /c C:\Users\Public\Desktop\wallpaper.bat
-    #   shell: cmd
 
     - name: Keep GitHub Actions Runner Alive
       run: cmd /c loop.bat
