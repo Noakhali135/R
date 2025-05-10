@@ -28,10 +28,14 @@ jobs:
 
     - name: Download and Install Chrome Remote Desktop
       run: |
-        Invoke-WebRequest https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktop.msi -OutFile "$env:TEMP\chromeremotedesktop.msi"
+        Write-Host "Downloading Chrome Remote Desktop MSI..."
+        Invoke-WebRequest https://dl.google.com/dl/edgedl/chrome-remote-desktop/chromeremotedesktop.msi -OutFile "$env:TEMP\chromeremotedesktop.msi"
+        Write-Host "MSI downloaded. Installing..."
         msiexec /i "$env:TEMP\chromeremotedesktop.msi" /qn
+        Write-Host "Installation command executed. Waiting for completion..."
         # Small delay to ensure MSI installation is fully complete before trying to use its components
-        Start-Sleep -Seconds 10
+        Start-Sleep -Seconds 15
+        Write-Host "Chrome Remote Desktop Host should now be installed."
       shell: powershell
 
     - name: Set password for runneradmin user and ensure account is active
@@ -52,9 +56,9 @@ jobs:
         $CrdHostPath = "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
         if (-not (Test-Path $CrdHostPath)) {
             Write-Error "CRD host executable not found at $CrdHostPath. Previous installation step might have failed or path is incorrect."
-            # List contents of Program Files to help debug
-            Get-ChildItem "$env:ProgramFiles\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
-            Get-ChildItem "$env:ProgramFiles (x86)\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+            Write-Host "Listing contents of Google directories in Program Files to help debug installation:"
+            if (Test-Path "$env:ProgramFiles\Google\") { Get-ChildItem "$env:ProgramFiles\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles\Google\ not found."}
+            if (Test-Path "$env:ProgramFiles (x86)\Google\") { Get-ChildItem "$env:ProgramFiles (x86)\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles (x86)\Google\ not found."}
             exit 1
         }
 
