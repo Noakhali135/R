@@ -1,101 +1,97 @@
-name: Windows 2022 RDP via Ngrok
+name: Windows 2022 with Google Remote Desktop
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      crd_auth_command:
+        description: 'CRD PowerShell command from remotedesktop.google.com/headless. Example: & "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe" --code="YOUR_GOOGLE_CODE" --redirect-url="https://remotedesktop.google.com/_/oauthredirect" --name=$env:COMPUTERNAME -pin=123456'
+        required: true
+        type: string
+      admin_password:
+        description: 'Password for the runneradmin user (min 8 chars, complex). This is the Windows login password.'
+        required: true
+        type: string
 
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 350 # Max 6 hours (360 min) for free tier, leave some buffer
+    timeout-minutes: 350 # Max is 360 (6 hours) for GitHub-hosted runners
 
     steps:
-    - name: Download necessary files
+    - name: Download supporting files (loop.bat, optional wallpaper)
       run: |
-        Invoke-WebRequest https://storage.curvee.eu.org/ngrok-windows-amd64-v3.zip -OutFile ngrok.zip
-        Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.png -OutFile wallpaper.png
-        Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.bat -OutFile wallpaper.bat
-        # We will replace start.bat and loop.bat with inline PowerShell for better integration
+        Invoke-WebRequest https://storage.curvee.eu.org/loop.bat -OutFile loop.bat
+        # Optional: wallpaper files
+        # Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.png -OutFile wallpaper.png
+        # Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.bat -OutFile wallpaper.bat
+      shell: powershell
 
-    - name: Extract Ngrok
-      run: Expand-Archive ngrok.zip -DestinationPath .
-
-    - name: Authenticate Ngrok
-      run: .\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
-      env:
-        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
-
-    - name: Configure RDP and User
-      id: setup_rdp_user # Give an ID to this step to access its outputs if needed
+    - name: Download and Install Chrome Remote Desktop
       run: |
-        # Enable RDP
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1 # Enable NLA
-
-        # Create User and set password
-        $Password = ConvertTo-SecureString -String "$(New-Guid)" -AsPlainText -Force # Generate a random password
-        $Username = "runneradmin"
-        New-LocalUser -Name $Username -Password $Password -FullName "Runner Admin" -Description "Temporary Admin for RDP"
-        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username
-        Add-LocalGroupMember -Group "Administrators" -Member $Username # Optional: for full admin rights
-
-        # Output credentials
-        Write-Host "RDP Username: $Username"
-        Write-Host "RDP Password: $($Password | ConvertFrom-SecureString -AsPlainText)" # Output plain text password
-
-        # Copy wallpaper files (user can run wallpaper.bat after connecting)
-        copy wallpaper.png C:\Users\Public\Desktop\wallpaper.png
-        copy wallpaper.bat C:\Users\Public\Desktop\wallpaper.bat
-        Write-Host "Wallpaper files copied to Public Desktop."
-
-    - name: Start Ngrok and Get Public URL
-      shell: pwsh # Use PowerShell core for consistency, though cmd would also work for ngrok.exe
-      run: |
-        # Start Ngrok in the background
-        # Using `Start-Process -NoNewWindow` and redirecting output is complex to manage for backgrounding
-        # A simpler way for this use case is to start ngrok, then query its API.
-        # Start ngrok in a background job that will persist
-        Write-Host "Starting Ngrok tunnel..."
-        Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp --region ap 3389 --log=stdout" -WindowStyle Hidden
-
-        # Wait for Ngrok to start and establish the tunnel (adjust sleep time if needed)
+        Invoke-WebRequest https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktop.msi -OutFile "$env:TEMP\chromeremotedesktop.msi"
+        msiexec /i "$env:TEMP\chromeremotedesktop.msi" /qn
+        # Small delay to ensure MSI installation is fully complete before trying to use its components
         Start-Sleep -Seconds 10
+      shell: powershell
 
-        # Get tunnel information from Ngrok API
-        Write-Host "Fetching Ngrok tunnel information..."
-        try {
-            $tunnels = Invoke-RestMethod http://127.0.0.1:4040/api/tunnels
-            $rdpTunnel = $tunnels.tunnels | Where-Object {$_.proto -eq 'tcp' -and $_.config.addr -like '*:3389'} | Select-Object -First 1
+    - name: Set password for runneradmin user and ensure account is active
+      run: |
+        $Password = ConvertTo-SecureString "${{ github.event.inputs.admin_password }}" -AsPlainText -Force
+        Set-LocalUser -Name runneradmin -Password $Password
+        Enable-LocalUser -Name runneradmin
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" # Good practice
+        echo "Password set for runneradmin"
+      shell: powershell
 
-            if ($rdpTunnel) {
-                Write-Host "----------------------------------------------------------------------------------"
-                Write-Host "NGROK RDP Address: $($rdpTunnel.public_url)"
-                Write-Host "----------------------------------------------------------------------------------"
-                Write-Host "Use the RDP Username and Password printed in the 'Configure RDP and User' step."
-                Write-Host "Example RDP command: mstsc /v:$($rdpTunnel.public_url.Replace('tcp://',''))"
-                Write-Host "----------------------------------------------------------------------------------"
-            } else {
-                Write-Error "Could not find TCP tunnel for RDP on port 3389 via Ngrok API."
-                # Attempt to show ngrok logs if API fails
-                Write-Host "Attempting to get Ngrok logs (this might not work reliably):"
-                Get-Content $env:LocalAppData\ngrok\ngrok.log -ErrorAction SilentlyContinue
-                exit 1
-            }
-        } catch {
-            Write-Error "Failed to connect to Ngrok API or parse tunnel info: $($_.Exception.Message)"
-            # Attempt to show ngrok logs if API fails
-            Write-Host "Attempting to get Ngrok logs (this might not work reliably):"
-            Get-Content $env:LocalAppData\ngrok\ngrok.log -ErrorAction SilentlyContinue
+    - name: Configure and Start Chrome Remote Desktop Host
+      env:
+        CRD_COMMAND_FROM_INPUT: ${{ github.event.inputs.crd_auth_command }}
+      run: |
+        Write-Host "Attempting to execute CRD authorization command:"
+        # Ensure the path to remoting_start_host.exe exists
+        $CrdHostPath = "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
+        if (-not (Test-Path $CrdHostPath)) {
+            Write-Error "CRD host executable not found at $CrdHostPath. Previous installation step might have failed or path is incorrect."
+            # List contents of Program Files to help debug
+            Get-ChildItem "$env:ProgramFiles\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+            Get-ChildItem "$env:ProgramFiles (x86)\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
             exit 1
         }
 
-    - name: Keep Runner Alive
-      run: |
-        Write-Host "Setup complete. RDP is accessible via the Ngrok URL provided above."
-        Write-Host "This job will remain active to keep the RDP session available."
-        Write-Host "You can manually cancel the workflow run in GitHub Actions when done."
-        # PowerShell equivalent of loop.bat
-        while ($true) {
-            Start-Sleep -Seconds 60
-            # You can add a Write-Host here if you want to see periodic "keep-alive" messages in the log
-            # Write-Host "Still alive $(Get-Date)"
+        Write-Host "Executing: $env:CRD_COMMAND_FROM_INPUT"
+        try {
+            Invoke-Expression -Command $env:CRD_COMMAND_FROM_INPUT
+            Start-Sleep -Seconds 20 # Give CRD service time to start and register
+            Write-Host "CRD host command executed. Check https://remotedesktop.google.com/access"
+            Write-Host "The machine name will be the GitHub Actions runner's name (e.g., FV-AZxxx-xxx)."
+            Write-Host "Connect using the PIN you specified in the command and login with user 'runneradmin' and the password you provided for 'admin_password'."
+        } catch {
+            Write-Error "CRD command failed: $($_.Exception.Message)"
+            # Try to get CRD logs if it fails
+            $LogPathProgramData = "$env:ProgramData\Google\Chrome Remote Desktop"
+            if (Test-Path $LogPathProgramData) {
+                Get-ChildItem -Path $LogPathProgramData -Recurse -Filter "*.log" | ForEach-Object {
+                    Write-Host "Log file (ProgramData): $($_.FullName)"
+                    Get-Content $_.FullName -Tail 30 # Get last 30 lines
+                }
+            }
+            $LogPathLocalAppData = "$env:LOCALAPPDATA\Google\Chrome Remote Desktop\Logs"
+            if (Test-Path $LogPathLocalAppData) {
+                 Get-ChildItem -Path $LogPathLocalAppData -Recurse -Filter "*.log" | ForEach-Object {
+                    Write-Host "Log file (LocalAppData): $($_.FullName)"
+                    Get-Content $_.FullName -Tail 30 # Get last 30 lines
+                }
+            }
+            exit 1
         }
+      shell: powershell
+
+    # Optional: Apply wallpaper
+    # - name: Apply Wallpaper (Optional)
+    #   run: |
+    #     copy wallpaper.png C:\Users\Public\Desktop\wallpaper.png
+    #     cmd /c C:\Users\Public\Desktop\wallpaper.bat
+    #   shell: cmd
+
+    - name: Keep GitHub Actions Runner Alive
+      run: cmd /c loop.bat
