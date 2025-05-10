@@ -1,0 +1,101 @@
+name: Windows 2022 RDP via Ngrok
+
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350 # Max 6 hours (360 min) for free tier, leave some buffer
+
+    steps:
+    - name: Download necessary files
+      run: |
+        Invoke-WebRequest https://storage.curvee.eu.org/ngrok-windows-amd64-v3.zip -OutFile ngrok.zip
+        Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.png -OutFile wallpaper.png
+        Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.bat -OutFile wallpaper.bat
+        # We will replace start.bat and loop.bat with inline PowerShell for better integration
+
+    - name: Extract Ngrok
+      run: Expand-Archive ngrok.zip -DestinationPath .
+
+    - name: Authenticate Ngrok
+      run: .\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+      env:
+        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+
+    - name: Configure RDP and User
+      id: setup_rdp_user # Give an ID to this step to access its outputs if needed
+      run: |
+        # Enable RDP
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1 # Enable NLA
+
+        # Create User and set password
+        $Password = ConvertTo-SecureString -String "$(New-Guid)" -AsPlainText -Force # Generate a random password
+        $Username = "runneradmin"
+        New-LocalUser -Name $Username -Password $Password -FullName "Runner Admin" -Description "Temporary Admin for RDP"
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username
+        Add-LocalGroupMember -Group "Administrators" -Member $Username # Optional: for full admin rights
+
+        # Output credentials
+        Write-Host "RDP Username: $Username"
+        Write-Host "RDP Password: $($Password | ConvertFrom-SecureString -AsPlainText)" # Output plain text password
+
+        # Copy wallpaper files (user can run wallpaper.bat after connecting)
+        copy wallpaper.png C:\Users\Public\Desktop\wallpaper.png
+        copy wallpaper.bat C:\Users\Public\Desktop\wallpaper.bat
+        Write-Host "Wallpaper files copied to Public Desktop."
+
+    - name: Start Ngrok and Get Public URL
+      shell: pwsh # Use PowerShell core for consistency, though cmd would also work for ngrok.exe
+      run: |
+        # Start Ngrok in the background
+        # Using `Start-Process -NoNewWindow` and redirecting output is complex to manage for backgrounding
+        # A simpler way for this use case is to start ngrok, then query its API.
+        # Start ngrok in a background job that will persist
+        Write-Host "Starting Ngrok tunnel..."
+        Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp --region ap 3389 --log=stdout" -WindowStyle Hidden
+
+        # Wait for Ngrok to start and establish the tunnel (adjust sleep time if needed)
+        Start-Sleep -Seconds 10
+
+        # Get tunnel information from Ngrok API
+        Write-Host "Fetching Ngrok tunnel information..."
+        try {
+            $tunnels = Invoke-RestMethod http://127.0.0.1:4040/api/tunnels
+            $rdpTunnel = $tunnels.tunnels | Where-Object {$_.proto -eq 'tcp' -and $_.config.addr -like '*:3389'} | Select-Object -First 1
+
+            if ($rdpTunnel) {
+                Write-Host "----------------------------------------------------------------------------------"
+                Write-Host "NGROK RDP Address: $($rdpTunnel.public_url)"
+                Write-Host "----------------------------------------------------------------------------------"
+                Write-Host "Use the RDP Username and Password printed in the 'Configure RDP and User' step."
+                Write-Host "Example RDP command: mstsc /v:$($rdpTunnel.public_url.Replace('tcp://',''))"
+                Write-Host "----------------------------------------------------------------------------------"
+            } else {
+                Write-Error "Could not find TCP tunnel for RDP on port 3389 via Ngrok API."
+                # Attempt to show ngrok logs if API fails
+                Write-Host "Attempting to get Ngrok logs (this might not work reliably):"
+                Get-Content $env:LocalAppData\ngrok\ngrok.log -ErrorAction SilentlyContinue
+                exit 1
+            }
+        } catch {
+            Write-Error "Failed to connect to Ngrok API or parse tunnel info: $($_.Exception.Message)"
+            # Attempt to show ngrok logs if API fails
+            Write-Host "Attempting to get Ngrok logs (this might not work reliably):"
+            Get-Content $env:LocalAppData\ngrok\ngrok.log -ErrorAction SilentlyContinue
+            exit 1
+        }
+
+    - name: Keep Runner Alive
+      run: |
+        Write-Host "Setup complete. RDP is accessible via the Ngrok URL provided above."
+        Write-Host "This job will remain active to keep the RDP session available."
+        Write-Host "You can manually cancel the workflow run in GitHub Actions when done."
+        # PowerShell equivalent of loop.bat
+        while ($true) {
+            Start-Sleep -Seconds 60
+            # You can add a Write-Host here if you want to see periodic "keep-alive" messages in the log
+            # Write-Host "Still alive $(Get-Date)"
+        }
