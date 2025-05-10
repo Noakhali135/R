@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 350 # Max is 360 (6 hours) for GitHub-hosted runners
+    timeout-minutes: 350
 
     steps:
     - name: Download supporting files (loop.bat, optional wallpaper)
@@ -26,48 +26,14 @@ jobs:
         # Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.bat -OutFile wallpaper.bat
       shell: powershell
 
-    - name: Download and Install Chrome Remote Desktop
+    - name: Install Chrome Remote Desktop using Chocolatey
       run: |
-        $msiUrl = "https://dl.google.com/dl/edgedl/chrome-remote-desktop/chromeremotedesktop.msi"
-        $outputFile = "$env:TEMP\chromeremotedesktop.msi"
-        
-        Write-Host "Attempting to download Chrome Remote Desktop MSI using curl..."
-        Write-Host "URL: $msiUrl"
-        Write-Host "Output File: $outputFile"
-        
-        try {
-            # Use curl.exe to download. -L follows redirects. -o specifies output file.
-            # --fail makes curl exit with an error on HTTP server errors (4xx, 5xx).
-            # --show-error displays the error from the server.
-            # We'll also add -S to show errors but not progress meter for cleaner logs unless an error occurs.
-            curl.exe -L -S --fail --show-error -o $outputFile $msiUrl
-            
-            if (-not (Test-Path $outputFile)) {
-                Write-Error "curl download failed: Output file not found at $outputFile"
-                exit 1
-            }
-            if ((Get-Item $outputFile).Length -lt 1000000) { # CRD MSI is usually >20MB
-                Write-Error "curl download failed: Output file is too small or empty. Size: $((Get-Item $outputFile).Length) bytes."
-                Write-Host "Attempting to display content of small downloaded file (might be an error page):"
-                Get-Content $outputFile -TotalCount 20 -ErrorAction SilentlyContinue # Display first 20 lines
-                exit 1
-            }
-            Write-Host "MSI downloaded successfully using curl. Size: $((Get-Item $outputFile).Length) bytes."
-        } catch {
-            Write-Error "curl command or subsequent check failed: $($_.Exception.Message)"
-            # If curl wrote an error to the output file path (e.g. HTML error page if --fail wasn't perfect)
-            if (Test-Path $outputFile) {
-                Write-Host "Content of the output file (may contain error details from server if --fail didn't catch it):"
-                Get-Content $outputFile -TotalCount 20 -ErrorAction SilentlyContinue
-            }
-            exit 1
-        }
-        
-        Write-Host "MSI downloaded. Installing..."
-        msiexec /i $outputFile /qn
-        Write-Host "Installation command executed. Waiting for completion..."
-        Start-Sleep -Seconds 15 # Give MSI time to fully install
-        Write-Host "Chrome Remote Desktop Host should now be installed."
+        Write-Host "Attempting to install Google Chrome Remote Desktop using Chocolatey..."
+        choco install google-chrome-remote-desktop -y --no-progress --force
+        Write-Host "Chocolatey install command executed. Waiting for completion..."
+        # Chocolatey should wait for completion, but a small sleep can ensure services are ready
+        Start-Sleep -Seconds 20 
+        Write-Host "Google Chrome Remote Desktop Host should now be installed via Chocolatey."
       shell: powershell
 
     - name: Set password for runneradmin user and ensure account is active
@@ -85,23 +51,56 @@ jobs:
       run: |
         Write-Host "Attempting to execute CRD authorization command:"
         $CrdHostPath = "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
+        # Chocolatey might install to Program Files (x86) if it picks up a 32-bit installer, though unlikely for CRD.
+        # Let's check both common paths.
         if (-not (Test-Path $CrdHostPath)) {
-            Write-Error "CRD host executable not found at $CrdHostPath. Installation might have failed or path is incorrect."
-            Write-Host "Listing contents of Google directories in Program Files to help debug installation:"
-            if (Test-Path "$env:ProgramFiles\Google\") { Get-ChildItem "$env:ProgramFiles\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles\Google\ not found."}
-            if (Test-Path "$env:ProgramFiles (x86)\Google\") { Get-ChildItem "$env:ProgramFiles (x86)\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles (x86)\Google\ not found."}
-            exit 1
+            $CrdHostPathX86 = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
+            if (Test-Path $CrdHostPathX86) {
+                $CrdHostPath = $CrdHostPathX86
+                Write-Host "CRD host found in Program Files (x86)."
+            } else {
+                 Write-Error "CRD host executable not found at $CrdHostPath or $CrdHostPathX86. Installation via Chocolatey might have failed or path is unexpected."
+                 Write-Host "Listing contents of Google directories in Program Files to help debug installation:"
+                 if (Test-Path "$env:ProgramFiles\Google\") { Get-ChildItem "$env:ProgramFiles\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles\Google\ not found."}
+                 if (Test-Path "${env:ProgramFiles(x86)}\Google\") { Get-ChildItem "${env:ProgramFiles(x86)}\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "${env:ProgramFiles(x86)}\Google\ not found."}
+                 exit 1
+            }
         }
+        Write-Host "Using CRD host path: $CrdHostPath"
 
-        Write-Host "Executing: $env:CRD_COMMAND_FROM_INPUT"
+        # Modify the input command to use the determined $CrdHostPath
+        # This is a bit tricky as the input is a full command string.
+        # We'll assume the user's input command uses "$env:ProgramFiles\..." and try to replace that part.
+        # A more robust way would be to parse the command, but this is a common case.
+        $UserCommand = $env:CRD_COMMAND_FROM_INPUT
+        if ($CrdHostPath -ne "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe") {
+            Write-Host "Adjusting CRD command to use actual installed path: $CrdHostPath"
+            # This replacement is fragile. It assumes the user provided the command with the $env:ProgramFiles path.
+            $UserCommand = $UserCommand -replace [regex]::Escape('"$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"'), ('"'+$CrdHostPath+'"')
+            $UserCommand = $UserCommand -replace [regex]::Escape('"${env:ProgramFiles}\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"'), ('"'+$CrdHostPath+'"')
+        }
+        
+        Write-Host "Executing: $UserCommand"
         try {
-            Invoke-Expression -Command $env:CRD_COMMAND_FROM_INPUT
-            Start-Sleep -Seconds 20
+            Invoke-Expression -Command $UserCommand
+            Start-Sleep -Seconds 25 # Give CRD service more time to start and register
             Write-Host "CRD host command executed. Check https://remotedesktop.google.com/access"
-            # ... (rest of messages)
+            Write-Host "The machine name will be the GitHub Actions runner's name (e.g., FV-AZxxx-xxx)."
+            Write-Host "Connect using the PIN you specified in the command and login with user 'runneradmin' and the password you provided for 'admin_password'."
         } catch {
             Write-Error "CRD command failed: $($_.Exception.Message)"
-            # ... (log dumping logic)
+            $LogPathProgramData = "$env:ProgramData\Google\Chrome Remote Desktop"
+            if (Test-Path $LogPathProgramData) {
+                Get-ChildItem -Path $LogPathProgramData -Recurse -Filter "*.log" | ForEach-Object {
+                    Write-Host "Log file (ProgramData): $($_.FullName)"; Get-Content $_.FullName -Tail 30
+                }
+            }
+            $LogPathLocalAppData = "$env:LOCALAPPDATA\Google\Chrome Remote Desktop\Logs"
+            if (Test-Path $LogPathLocalAppData) {
+                 Get-ChildItem -Path $LogPathLocalAppData -Recurse -Filter "*.log" | ForEach-Object {
+                    Write-Host "Log file (LocalAppData): $($_.FullName)"; Get-Content $_.FullName -Tail 30
+                }
+            }
             exit 1
         }
       shell: powershell
