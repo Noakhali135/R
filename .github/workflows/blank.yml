@@ -21,18 +21,81 @@ jobs:
     - name: Download supporting files (loop.bat, optional wallpaper)
       run: |
         Invoke-WebRequest https://storage.curvee.eu.org/loop.bat -OutFile loop.bat
-        # Optional: wallpaper files
-        # Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.png -OutFile wallpaper.png
-        # Invoke-WebRequest https://storage.curvee.eu.org/wallpaper.bat -OutFile wallpaper.bat
       shell: powershell
 
-    - name: Install Chrome Remote Desktop using Chocolatey
+    - name: Install Chrome Remote Desktop using Chocolatey (with diagnostics and retry)
       run: |
-        Write-Host "Attempting to install Google Chrome Remote Desktop using Chocolatey..."
-        choco install google-chrome-remote-desktop -y --no-progress --force
-        Write-Host "Chocolatey install command executed. Waiting for completion..."
-        # Chocolatey should wait for completion, but a small sleep can ensure services are ready
-        Start-Sleep -Seconds 20 
+        Write-Host "Chocolatey version:"
+        choco --version
+        
+        Write-Host "Updating Chocolatey to the latest version..."
+        # Use Start-Process with -Wait to ensure the upgrade completes before proceeding
+        Start-Process -FilePath choco -ArgumentList "upgrade chocolatey -y --no-progress" -Wait -PassThru | Out-Default
+        
+        Write-Host "Listing Chocolatey sources..."
+        choco source list
+        
+        Write-Host "Clearing Chocolatey HTTP cache..."
+        # Ensure cache is in a writable temp location and clear existing cache files
+        $chocoCacheDir = Join-Path $env:TEMP "chocolatey_cache"
+        choco config set cacheLocation $chocoCacheDir
+        Remove-Item (Join-Path $chocoCacheDir "http*") -Recurse -Force -ErrorAction SilentlyContinue
+        
+        $packageName = "google-chrome-remote-desktop"
+        $chocoSource = "https://community.chocolatey.org/api/v2/" # Explicitly using the community feed
+        $maxRetries = 5 # Number of times to retry the installation
+        $retryCount = 0
+        $installSuccess = $false
+        $sleepBetweenRetries = 15 # Seconds to wait between retries
+
+        Write-Host "Attempting to install '$packageName' from source '$chocoSource' with retry logic..."
+
+        while ($retryCount -lt $maxRetries -and -not $installSuccess) {
+            Write-Host "Installation attempt $($retryCount + 1) of $maxRetries..."
+            
+            # Define temporary files for capturing command output
+            $outputFile = Join-Path $env:TEMP "choco_install_output_$retryCount.txt"
+            $errorFile = Join-Path $env:TEMP "choco_install_error_$retryCount.txt"
+            
+            # Execute choco install using Start-Process to reliably capture exit code and output
+            $process = Start-Process -FilePath choco -ArgumentList "install $packageName -y --source $chocoSource --verbose --debug" -Wait -PassThru -RedirectStandardOutput $outputFile -RedirectStandardError $errorFile
+
+            # Output captured logs for visibility in GitHub Actions
+            Write-Host "--- Start of choco install output (Attempt $($retryCount + 1)) ---"
+            Get-Content $outputFile
+            Write-Host "--- End of choco install output (Attempt $($retryCount + 1)) ---"
+
+            # Output captured errors, marking them as errors in GitHub Actions
+            $errorContent = Get-Content $errorFile
+            if ($errorContent) {
+                Write-Host "--- Start of choco install errors (Attempt $($retryCount + 1)) ---"
+                $errorContent | Write-Error
+                Write-Host "--- End of choco install errors (Attempt $($retryCount + 1)) ---"
+            }
+
+            $lastExitCode = $process.ExitCode
+            Write-Host "choco install exited with code: $lastExitCode"
+            
+            if ($lastExitCode -eq 0) {
+                Write-Host "Installation successful!"
+                $installSuccess = $true
+            } elseif ($lastExitCode -eq 1 || $lastExitCode -eq 1641 || $lastExitCode -eq 3010) {
+                # Common Chocolatey failure/reboot needed codes - treat as failure for retry purposes
+                Write-Host "Installation failed with exit code $lastExitCode. Retrying in $sleepBetweenRetries seconds..."
+                Start-Sleep -Seconds $sleepBetweenRetries
+                $retryCount++
+            } else {
+                # Other unexpected non-zero exit codes
+                Write-Error "Installation failed with unexpected exit code $lastExitCode. Aborting retries."
+                exit $lastExitCode # Exit the step with the failure code
+            }
+        }
+
+        if (-not $installSuccess) {
+            Write-Error "Failed to install '$packageName' after $maxRetries attempts."
+            exit 1 # Indicate failure if retries exhausted
+        }
+        
         Write-Host "Google Chrome Remote Desktop Host should now be installed via Chocolatey."
       shell: powershell
 
@@ -49,59 +112,73 @@ jobs:
       env:
         CRD_COMMAND_FROM_INPUT: ${{ github.event.inputs.crd_auth_command }}
       run: |
-        Write-Host "Attempting to execute CRD authorization command:"
+        Write-Host "Attempting to locate CRD host executable..."
         $CrdHostPath = "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
-        # Chocolatey might install to Program Files (x86) if it picks up a 32-bit installer, though unlikely for CRD.
-        # Let's check both common paths.
+        $CrdHostPathX86 = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
+
         if (-not (Test-Path $CrdHostPath)) {
-            $CrdHostPathX86 = "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"
             if (Test-Path $CrdHostPathX86) {
                 $CrdHostPath = $CrdHostPathX86
                 Write-Host "CRD host found in Program Files (x86)."
             } else {
-                 Write-Error "CRD host executable not found at $CrdHostPath or $CrdHostPathX86. Installation via Chocolatey might have failed or path is unexpected."
-                 Write-Host "Listing contents of Google directories in Program Files to help debug installation:"
-                 if (Test-Path "$env:ProgramFiles\Google\") { Get-ChildItem "$env:ProgramFiles\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "$env:ProgramFiles\Google\ not found."}
-                 if (Test-Path "${env:ProgramFiles(x86)}\Google\") { Get-ChildItem "${env:ProgramFiles(x86)}\Google\" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName } else { Write-Host "${env:ProgramFiles(x86)}\Google\ not found."}
+                 Write-Error "CRD host executable not found at expected paths. Check Chocolatey installation."
+                 # Optional: List directories to help debug missing executable
+                 Write-Host "Contents of Program Files:"
+                 Get-ChildItem "$env:ProgramFiles" | Select-Object Name, LastWriteTime, Mode
+                 Write-Host "Contents of Program Files (x86):"
+                 Get-ChildItem "${env:ProgramFiles(x86)}" | Select-Object Name, LastWriteTime, Mode
                  exit 1
             }
+        } else {
+             Write-Host "CRD host found in Program Files."
         }
         Write-Host "Using CRD host path: $CrdHostPath"
-
-        # Modify the input command to use the determined $CrdHostPath
-        # This is a bit tricky as the input is a full command string.
-        # We'll assume the user's input command uses "$env:ProgramFiles\..." and try to replace that part.
-        # A more robust way would be to parse the command, but this is a common case.
+        
         $UserCommand = $env:CRD_COMMAND_FROM_INPUT
+        Write-Host "Original CRD command from input: $UserCommand"
+
+        # Adjust the CRD command to use the detected host path if necessary
+        # Use regex escape to handle potential special characters in paths robustly
+        $escapedDefaultPath = [regex]::Escape('"$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"')
+        $escapedDefaultPathAlternate = [regex]::Escape('${env:ProgramFiles}\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"')
+        
         if ($CrdHostPath -ne "$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe") {
-            Write-Host "Adjusting CRD command to use actual installed path: $CrdHostPath"
-            # This replacement is fragile. It assumes the user provided the command with the $env:ProgramFiles path.
-            $UserCommand = $UserCommand -replace [regex]::Escape('"$env:ProgramFiles\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"'), ('"'+$CrdHostPath+'"')
-            $UserCommand = $UserCommand -replace [regex]::Escape('"${env:ProgramFiles}\Google\Chrome Remote Desktop\current_version\remoting_start_host.exe"'), ('"'+$CrdHostPath+'"')
+            Write-Host "Adjusting CRD command path..."
+            # Replace the default path in the user command with the actual found path
+            # Need to be careful to replace the path within the quotes
+            $UserCommand = $UserCommand -replace $escapedDefaultPath, ('"'+$CrdHostPath+'"')
+            $UserCommand = $UserCommand -replace $escapedDefaultPathAlternate, ('"'+$CrdHostPath+'"')
+             Write-Host "Adjusted CRD command: $UserCommand"
+        } else {
+             Write-Host "CRD host path matches default, no adjustment needed."
         }
         
-        Write-Host "Executing: $UserCommand"
+        Write-Host "Executing CRD authorization command:"
+        
         try {
+            # Execute the CRD command using Invoke-Expression
             Invoke-Expression -Command $UserCommand
-            Start-Sleep -Seconds 25 # Give CRD service more time to start and register
-            Write-Host "CRD host command executed. Check https://remotedesktop.google.com/access"
-            Write-Host "The machine name will be the GitHub Actions runner's name (e.g., FV-AZxxx-xxx)."
-            Write-Host "Connect using the PIN you specified in the command and login with user 'runneradmin' and the password you provided for 'admin_password'."
+            Write-Host "CRD host command executed. Giving it time to register..."
+            Start-Sleep -Seconds 30 # Increased sleep time
+            Write-Host "Check https://remotedesktop.google.com/access to see if the runner appears online."
+            Write-Host "If successful, you should now be able to connect using the PIN you provided in the CRD command."
         } catch {
             Write-Error "CRD command failed: $($_.Exception.Message)"
-            $LogPathProgramData = "$env:ProgramData\Google\Chrome Remote Desktop"
-            if (Test-Path $LogPathProgramData) {
-                Get-ChildItem -Path $LogPathProgramData -Recurse -Filter "*.log" | ForEach-Object {
-                    Write-Host "Log file (ProgramData): $($_.FullName)"; Get-Content $_.FullName -Tail 30
+            Write-Host "Dumping contents of the CRD logs directory if it exists..."
+            $crdLogsDir = "$env:LOCALAPPDATA\Google\Chrome Remote Desktop\HostLogs"
+            if (Test-Path $crdLogsDir) {
+                Get-ChildItem $crdLogsDir -Recurse
+                Get-ChildItem $crdLogsDir -Recurse | ForEach-Object {
+                    if (-not $_.PSIsContainer) {
+                         Write-Host "--- Content of $($_.FullName) ---"
+                         Get-Content $_.FullName -ErrorAction SilentlyContinue
+                         Write-Host "--- End of $($_.FullName) ---"
+                    }
                 }
+            } else {
+                Write-Host "CRD logs directory not found at $crdLogsDir."
             }
-            $LogPathLocalAppData = "$env:LOCALAPPDATA\Google\Chrome Remote Desktop\Logs"
-            if (Test-Path $LogPathLocalAppData) {
-                 Get-ChildItem -Path $LogPathLocalAppData -Recurse -Filter "*.log" | ForEach-Object {
-                    Write-Host "Log file (LocalAppData): $($_.FullName)"; Get-Content $_.FullName -Tail 30
-                }
-            }
-            exit 1
+            exit 1 # Indicate failure
         }
       shell: powershell
 
